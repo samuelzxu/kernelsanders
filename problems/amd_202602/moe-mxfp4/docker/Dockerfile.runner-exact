@@ -1,0 +1,34 @@
+# Dockerfile matching the GPU MODE runner environment for pre-compiling AITER modules
+# Runner: ROCm 7.1, PyTorch 2.10.0+rocm7.1, Ubuntu 24.04, Python 3.12, gfx950
+# Using rocm/pytorch image which already has PyTorch + ROCm installed
+
+FROM rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.10.0
+
+ENV DEBIAN_FRONTEND=noninteractive
+# Force gfx950 target for cross-compilation (no GPU needed)
+ENV AMDGPU_TARGETS=gfx950
+ENV GPU_TARGETS=gfx950
+ENV HIP_VISIBLE_DEVICES=""
+ENV PYTORCH_ROCM_ARCH=gfx950
+
+# Install any missing build tools
+RUN apt-get update && apt-get install -y git cmake ninja-build && rm -rf /var/lib/apt/lists/*
+
+# Create runner-like directory structure
+RUN mkdir -p /home/runner/aiter
+
+# Clone and install AITER
+WORKDIR /home/runner/aiter
+RUN git clone https://github.com/ROCm/aiter.git . 2>&1 || \
+    git clone https://github.com/ROCmSoftwarePlatform/aiter.git . 2>&1
+
+# Install AITER dependencies and in develop mode
+RUN pip install --break-system-packages -e . 2>&1 || true
+
+# Build script that compiles only the MOE modules we need
+COPY build_moe_modules.py /tmp/build_moe_modules.py
+RUN python3 /tmp/build_moe_modules.py 2>&1 | tee /tmp/build_log.txt || true
+
+# Output directory for .so files
+RUN mkdir -p /output
+CMD ["bash", "-c", "cp /home/runner/aiter/aiter/jit/*.so /output/ 2>/dev/null; ls -la /output/"]

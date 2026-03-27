@@ -1,0 +1,16 @@
+# Build AITER modules in the EXACT runner image for perfect ABI compatibility
+FROM ghcr.io/gpu-mode/amd-runner:main
+
+ENV GPU_ARCHS=gfx950
+ENV CU_NUM=256
+ENV HIP_VISIBLE_DEVICES=""
+
+# AITER is already installed at /home/runner/aiter
+WORKDIR /home/runner/aiter
+
+# Build MOE modules
+COPY build_moe_modules_v2.py /tmp/build_moe_modules_v2.py
+RUN python3 /tmp/build_moe_modules_v2.py 2>&1 | tee /tmp/build_log.txt
+
+RUN mkdir -p /output
+CMD ["bash", "-c", "cp /home/runner/aiter/aiter/jit/*.so /output/ 2>/dev/null; echo '=== Built modules ==='; ls -lh /output/"]

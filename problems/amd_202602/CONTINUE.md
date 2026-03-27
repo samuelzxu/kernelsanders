@@ -1,0 +1,3 @@
+/loop 30m If you hit a dead end or think you are stuck, find a way out. Make sure to pursue all potential leads to their natural conclusion, and push through any bugs that arise which can be solved. Do not EVER wait for my approval, comments, or feedback of any sort. You are the gpu kernel researcher taking lead on this, and you have full permissions on this machine to make this work. You got this. Keep pushing.
+
+Write to a local PROGRESS.md file. Only append to it and mark a new entry with a separator: ==== yyyy-mm-dd-hh:hh

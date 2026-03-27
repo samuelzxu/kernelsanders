@@ -1,0 +1,6 @@
+FROM aiter-ck
+ENV GPU_ARCHS=gfx950
+ENV CU_NUM=256
+COPY build_ck2stages.py /tmp/build.py
+RUN python3 /tmp/build.py 2>&1 | tee /tmp/build_log.txt; exit 0
+RUN cp /home/runner/aiter/aiter/jit/module_moe_ck2stages_*.so /output/ 2>/dev/null; ls -lh /output/
