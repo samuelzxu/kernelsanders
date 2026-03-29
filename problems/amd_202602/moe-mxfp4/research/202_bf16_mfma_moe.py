@@ -242,7 +242,7 @@ def _get_mod():
         return _mod
     try:
         from torch.utils.cpp_extension import load_inline
-        _mod = load_inline(name='moe_bf16_v202q', cpp_sources=_cpp_src, cuda_sources=_hip_src,
+        _mod = load_inline(name='moe_bf16_v202r', cpp_sources=_cpp_src, cuda_sources=_hip_src,
                            functions=['moe_bf16_grouped_gemm'], verbose=False,
                            extra_cuda_cflags=['-O3', '-w', '-mcumode', '--offload-arch=gfx950'])
         print("[v202] BF16 MFMA module compiled", file=sys.stderr)
@@ -299,19 +299,16 @@ def _patched(token, model_dim, inter_dim, expert, topk,
     md = _orig(token, model_dim, inter_dim, expert, topk, dtype, q_dtype_a, q_dtype_w,
                q_type, use_g1u1, activation, doweight_stage1, hidden_pad, intermediate_pad, is_shuffled)
     tpe = (token * topk) / expert
-    if inter_dim > 1024: pass
-    elif tpe < 5:
-        md.ksplit = 2; md.block_m = 16 if token < 2048 else 32
+    use_cktile = False; sk = 1
+    if inter_dim > 1024: use_cktile = False
+    elif tpe < 5: use_cktile = True; sk = 2
+    elif tpe < 40 and expert <= 33: use_cktile = True; sk = 1
+    if use_cktile and is_shuffled:
+        md.ksplit = 2
+        md.block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         md.stage1 = functools.partial(cktile_moe_stage1,
             n_pad_zeros=intermediate_pad//64*64*(2 if use_g1u1 else 1),
-            k_pad_zeros=hidden_pad//128*128, activation=ActivationType.Silu, split_k=2)
-        md.stage2 = functools.partial(cktile_moe_stage2,
-            n_pad_zeros=hidden_pad//64*64, k_pad_zeros=intermediate_pad//128*128, activation=ActivationType.Silu)
-        return md
-    elif tpe < 40 and expert <= 33:
-        md.stage1 = functools.partial(cktile_moe_stage1,
-            n_pad_zeros=intermediate_pad//64*64*(2 if use_g1u1 else 1),
-            k_pad_zeros=hidden_pad//128*128, activation=ActivationType.Silu, split_k=1)
+            k_pad_zeros=hidden_pad//128*128, activation=ActivationType.Silu, split_k=sk)
         md.stage2 = functools.partial(cktile_moe_stage2,
             n_pad_zeros=hidden_pad//64*64, k_pad_zeros=intermediate_pad//128*128, activation=ActivationType.Silu)
         return md
@@ -346,7 +343,34 @@ def custom_kernel(data: input_t) -> output_t:
                          w1_scale=w1s, w2_scale=w2s, a1_scale=None, a2_scale=None,
                          hidden_pad=hp, intermediate_pad=ip)
 
-    # Dense shapes: AITER fallback
+    # Dense shapes: try custom HIP kernel, fall back to AITER
+    mod = _get_mod()
+    if mod is not None:
+        try:
+            result = _custom_bf16_pipeline(hidden_states, gate_up_weight, down_weight,
+                                           gate_up_weight_scale, down_weight_scale,
+                                           topk_weights, topk_ids, M, E, topk, dep, dh, dhp)
+            # One-time validation
+            if not hasattr(custom_kernel, '_val'):
+                custom_kernel._val = True
+                ref = fused_moe(hidden_states, w1, w2, topk_weights, topk_ids,
+                                expert_mask=None, activation=ActivationType.Silu,
+                                quant_type=QuantType.per_1x32, doweight_stage1=False,
+                                w1_scale=w1s, w2_scale=w2s, a1_scale=None, a2_scale=None,
+                                hidden_pad=hp, intermediate_pad=ip)
+                err = (result.float() - ref.float()).abs().max().item()
+                print(f"[v202] VAL max_err={err:.4f}", file=sys.stderr)
+                if err > 0.05:
+                    print(f"[v202] VAL FAILED, using AITER", file=sys.stderr)
+                    custom_kernel._bad = True
+                    return ref
+            if hasattr(custom_kernel, '_bad'):
+                raise RuntimeError("validation failed")
+            return result
+        except Exception as e:
+            if not hasattr(custom_kernel, '_e'):
+                custom_kernel._e = True
+                print(f"[v202] ERR: {type(e).__name__}: {str(e)[:300]}", file=sys.stderr)
     return fused_moe(hidden_states, w1, w2, topk_weights, topk_ids,
                      expert_mask=None, activation=ActivationType.Silu,
                      quant_type=QuantType.per_1x32, doweight_stage1=False,
