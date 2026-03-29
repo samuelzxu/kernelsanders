@@ -115,64 +115,94 @@ void moe_bf16_gemm(
     int expert_id = sorted_expert_ids[m_block];
     if (expert_id < 0 || expert_id >= E) return;
 
-    // Per-thread accumulator: 16 output elements per thread
-    // 32x128 = 4096 total, 256 threads -> 16 each
-    float local_acc[16] = {0};
+    // MFMA 32x32x16 BF16 accumulator
+    // Each warp (64 threads) computes a 32x32 sub-tile
+    // 4 warps tile BLOCK_N=128: warp w handles N columns [w*32, (w+1)*32)
+    // MFMA output: 16 floats per thread = 32x32 tile
+    float mfma_acc[16] = {0};
     int m_base = m_block * BLOCK_M;
-    __shared__ float s_act[BLOCK_M * BLOCK_K];  // 4KB
-    __shared__ float s_wgt[BLOCK_N * BLOCK_K];  // 16KB
+    int warp_id = tid / 64;
+    int lane_id = tid % 64;
+    int warp_n = warp_id * 32;  // N-offset for this warp's sub-tile
+
+    // LDS: store as uint16 (bf16 raw bits) to save space
+    __shared__ uint16_t s_act[BLOCK_M * BLOCK_K];    // 32*32*2 = 2KB
+    __shared__ uint16_t s_wgt[BLOCK_N * BLOCK_K];    // 128*32*2 = 8KB
 
     for (int k_start = 0; k_start < K; k_start += BLOCK_K) {
         int k_group = k_start / 32;
-        // Load activation [BLOCK_M, BLOCK_K] -> LDS
+
+        // Load activation [BLOCK_M, BLOCK_K] -> LDS as bf16
         for (int i = tid; i < BLOCK_M * BLOCK_K; i += 256) {
             int m_l = i / BLOCK_K, k_l = i % BLOCK_K;
             int eid = sorted_ids[m_base + m_l];
             if (eid >= 0 && eid < num_valid) {
                 int tok = eid / topk;
                 if (tok >= 0 && tok < M_orig) {
-                    // Read bf16 as uint16, convert to float for LDS storage
-                    uint16_t raw = act_u16[tok * K + k_start + k_l];
-                    s_act[i] = __uint_as_float(((uint32_t)raw) << 16);
+                    s_act[i] = act_u16[tok * K + k_start + k_l];
                 } else {
-                    s_act[i] = 0.0f;
+                    s_act[i] = 0;
                 }
             } else {
-                s_act[i] = 0.0f;
+                s_act[i] = 0;
             }
         }
-        // Load+dequant weight [BLOCK_N, BLOCK_K] -> LDS
+
+        // Load+dequant weight [BLOCK_N, BLOCK_K] -> LDS as bf16
         for (int i = tid; i < BLOCK_N * BLOCK_K / 2; i += 256) {
             int n_l = i / (BLOCK_K/2), k_b = i % (BLOCK_K/2);
             int n_g = n_start + n_l;
             if (n_g < N) {
                 uint8_t fp4 = w_fp4[expert_id * stride_w_e + n_g * stride_w_n + k_start/2 + k_b];
                 float sc = e8m0_scale(w_scale[(int64_t)expert_id*N*stride_ws_n + n_g*stride_ws_n + k_group]);
-                s_wgt[n_l*BLOCK_K + k_b*2]   = fp4_to_float(fp4 & 0xF) * sc;
-                s_wgt[n_l*BLOCK_K + k_b*2+1] = fp4_to_float((fp4>>4)&0xF) * sc;
+                float v0 = fp4_to_float(fp4 & 0xF) * sc;
+                float v1 = fp4_to_float((fp4>>4)&0xF) * sc;
+                s_wgt[n_l*BLOCK_K + k_b*2]   = (uint16_t)(__float_as_uint(v0) >> 16);
+                s_wgt[n_l*BLOCK_K + k_b*2+1] = (uint16_t)(__float_as_uint(v1) >> 16);
             } else {
-                s_wgt[n_l*BLOCK_K + k_b*2] = 0.0f;
-                s_wgt[n_l*BLOCK_K + k_b*2+1] = 0.0f;
+                s_wgt[n_l*BLOCK_K + k_b*2] = 0;
+                s_wgt[n_l*BLOCK_K + k_b*2+1] = 0;
             }
         }
         __syncthreads();
-        // Accumulate: each thread computes 16 output elements
-        for (int e = 0; e < 16; e++) {
-            int flat = tid + e * 256;
-            int m_l = flat / BLOCK_N, n_l = flat % BLOCK_N;
-            float dot = 0.0f;
-            for (int kk = 0; kk < BLOCK_K; kk++)
-                dot += s_act[m_l*BLOCK_K+kk] * s_wgt[n_l*BLOCK_K+kk];
-            local_acc[e] += dot;
+
+        // MFMA 32x32x16 BF16: two calls for BLOCK_K=32 (K=16 each)
+        // Thread mapping from hipkittens:
+        //   A: row = lane_id % 32, K_offset = (lane_id / 32) * 8
+        //   B: col = lane_id % 32, K_offset = (lane_id / 32) * 8
+        typedef __attribute__((__vector_size__(8 * sizeof(short)))) short bf16x8_t;
+        typedef __attribute__((__vector_size__(16 * sizeof(float)))) float floatx16_t;
+
+        for (int k_sub = 0; k_sub < BLOCK_K; k_sub += 16) {
+            // Load A sub-tile [32, 16] from LDS -> registers
+            short a_reg[8];
+            int a_row = lane_id % 32;
+            int a_k_base = k_sub + (lane_id / 32) * 8;
+            for (int j = 0; j < 8; j++)
+                a_reg[j] = (short)s_act[a_row * BLOCK_K + a_k_base + j];
+
+            // Load B sub-tile [32, 16] from LDS -> registers (warp's N-slice)
+            short b_reg[8];
+            int b_col = lane_id % 32;
+            int b_k_base = k_sub + (lane_id / 32) * 8;
+            for (int j = 0; j < 8; j++)
+                b_reg[j] = (short)s_wgt[(warp_n + b_col) * BLOCK_K + b_k_base + j];
+
+            // MFMA: C += A * B^T (32x32x16 bf16)
+            *(floatx16_t*)mfma_acc = __builtin_amdgcn_mfma_f32_32x32x16_bf16(
+                *(bf16x8_t*)a_reg, *(bf16x8_t*)b_reg,
+                *(floatx16_t*)mfma_acc, 0, 0, 0);
         }
         __syncthreads();
     }
-    // Store
-    for (int e = 0; e < 16; e++) {
-        int flat = tid + e * 256;
-        int m_l = flat / BLOCK_N, n_l = flat % BLOCK_N;
-        if (n_start + n_l < N)
-            out_u16[(m_base + m_l) * N + n_start + n_l] = (uint16_t)(__float_as_uint(local_acc[e]) >> 16);
+
+    // Store MFMA output: thread t owns output[t%32, (t/32)*16 .. (t/32)*16+15]
+    int out_row = m_base + (lane_id % 32);
+    int out_col_base = n_start + warp_n + (lane_id / 32) * 16;
+    for (int i = 0; i < 16; i++) {
+        int col = out_col_base + i;
+        if (col < N)
+            out_u16[out_row * N + col] = (uint16_t)(__float_as_uint(mfma_acc[i]) >> 16);
     }
 
 }
@@ -242,7 +272,7 @@ def _get_mod():
         return _mod
     try:
         from torch.utils.cpp_extension import load_inline
-        _mod = load_inline(name='moe_bf16_v202t', cpp_sources=_cpp_src, cuda_sources=_hip_src,
+        _mod = load_inline(name='moe_bf16_v202u', cpp_sources=_cpp_src, cuda_sources=_hip_src,
                            functions=['moe_bf16_grouped_gemm'], verbose=False,
                            extra_cuda_cflags=['-O3', '-w', '-mcumode', '--offload-arch=gfx950'])
         print("[v202] BF16 MFMA module compiled", file=sys.stderr)
