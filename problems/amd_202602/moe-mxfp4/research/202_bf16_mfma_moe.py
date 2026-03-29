@@ -166,29 +166,30 @@ void moe_bf16_gemm(
         }
         __syncthreads();
 
-        // MFMA 32x32x16 BF16: two calls for BLOCK_K=32 (K=16 each)
-        // Thread mapping from hipkittens:
-        //   A: row = lane_id % 32, K_offset = (lane_id / 32) * 8
-        //   B: col = lane_id % 32, K_offset = (lane_id / 32) * 8
-        typedef __attribute__((__vector_size__(8 * sizeof(short)))) short bf16x8_t;
+        // BF16 MFMA 32x32x16 using native __bf16 type
+        // The bf16x8 vector matches what the MFMA intrinsic expects
+        typedef __attribute__((__vector_size__(8 * sizeof(__bf16)))) __bf16 bf16x8_t;
         typedef __attribute__((__vector_size__(16 * sizeof(float)))) float floatx16_t;
 
         for (int k_sub = 0; k_sub < BLOCK_K; k_sub += 16) {
-            // Load A sub-tile [32, 16] from LDS -> registers
-            short a_reg[8];
+            // Each thread loads 8 bf16 values for A and B
+            // row = lane_id % 32, K_group = (lane_id / 32) * 8
+            __bf16 a_reg[8];
             int a_row = lane_id % 32;
-            int a_k_base = k_sub + (lane_id / 32) * 8;
-            for (int j = 0; j < 8; j++)
-                a_reg[j] = (short)s_act[a_row * BLOCK_K + a_k_base + j];
+            int a_k = k_sub + (lane_id / 32) * 8;
+            for (int j = 0; j < 8; j++) {
+                uint16_t bits = s_act[a_row * BLOCK_K + a_k + j];
+                a_reg[j] = *(__bf16*)&bits;
+            }
 
-            // Load B sub-tile [32, 16] from LDS -> registers (warp's N-slice)
-            short b_reg[8];
+            __bf16 b_reg[8];
             int b_col = lane_id % 32;
-            int b_k_base = k_sub + (lane_id / 32) * 8;
-            for (int j = 0; j < 8; j++)
-                b_reg[j] = (short)s_wgt[(warp_n + b_col) * BLOCK_K + b_k_base + j];
+            int b_k = k_sub + (lane_id / 32) * 8;
+            for (int j = 0; j < 8; j++) {
+                uint16_t bits = s_wgt[(warp_n + b_col) * BLOCK_K + b_k + j];
+                b_reg[j] = *(__bf16*)&bits;
+            }
 
-            // MFMA: C += A * B^T (32x32x16 bf16)
             *(floatx16_t*)mfma_acc = __builtin_amdgcn_mfma_f32_32x32x16_bf16(
                 *(bf16x8_t*)a_reg, *(bf16x8_t*)b_reg,
                 *(floatx16_t*)mfma_acc, 0, 0, 0);
@@ -272,7 +273,7 @@ def _get_mod():
         return _mod
     try:
         from torch.utils.cpp_extension import load_inline
-        _mod = load_inline(name='moe_bf16_v202u', cpp_sources=_cpp_src, cuda_sources=_hip_src,
+        _mod = load_inline(name='moe_bf16_v202v', cpp_sources=_cpp_src, cuda_sources=_hip_src,
                            functions=['moe_bf16_grouped_gemm'], verbose=False,
                            extra_cuda_cflags=['-O3', '-w', '-mcumode', '--offload-arch=gfx950'])
         print("[v202] BF16 MFMA module compiled", file=sys.stderr)
