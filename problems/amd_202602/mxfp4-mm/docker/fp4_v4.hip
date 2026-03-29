@@ -10,7 +10,8 @@
 #define TM 32
 #define TN 32
 #define K_STEP 128     // FP4 packed bytes per K-iteration
-#define A_ROW_BYTES 512 // bf16 bytes per row per K-step (256 bf16 × 2)
+#define A_ROW_BYTES 512  // bf16 bytes per row per K-step (256 bf16 × 2)
+#define A_ROW_PAD 528    // padded to avoid LDS bank conflicts (512 + 16)
 #define NW 4
 #define NTH (64*NW)
 
@@ -57,26 +58,23 @@ void fp4_v4(
     v16f acc = {};
 
     // LDS: A bf16 + B FP4
-    __shared__ unsigned char lds_a[TM * A_ROW_BYTES];   // 32 × 512 = 16KB
+    __shared__ unsigned char lds_a[TM * A_ROW_PAD];   // 32 × 528 = 16.5KB (padded)
     __shared__ unsigned char lds_b[TN * K_STEP];         // 32 × 128 = 4KB
 
     for (int ki = 0; ki < K_steps; ki++) {
-        // Cooperative A bf16 load: 16KB = 256 threads × 64 bytes/thread
-        // Each thread loads 4 × uint4 (64 bytes)
-        {
-            int bytes_per_thread = A_ROW_BYTES * TM / NTH;  // 16384 / 256 = 64
-            for (int r = 0; r < bytes_per_thread; r += 16) {
-                int flat = tid * bytes_per_thread + r;
-                int a_r = flat / A_ROW_BYTES;
-                int a_c = flat % A_ROW_BYTES;
-                int abs_row = a_row + a_r;
-                int lds_idx = a_r * A_ROW_BYTES + a_c;
-                if (abs_row < M) {
-                    const unsigned char* src = (const unsigned char*)(A + abs_row * K) + ki * A_ROW_BYTES + a_c;
-                    *(uint4*)&lds_a[lds_idx] = *(const uint4*)src;
-                } else {
-                    *(uint4*)&lds_a[lds_idx] = make_uint4(0,0,0,0);
-                }
+        // Cooperative A bf16 load: 16KB = 1024 × uint4
+        // 256 threads × 4 rounds, COALESCED access (consecutive across threads)
+        for (int round = 0; round < 4; round++) {
+            int flat = (round * NTH + tid) * 16;  // consecutive 16B across threads
+            int a_r = flat / A_ROW_BYTES;
+            int a_c = flat % A_ROW_BYTES;
+            int abs_row = a_row + a_r;
+            int lds_idx = a_r * A_ROW_PAD + a_c;
+            if (abs_row < M) {
+                const unsigned char* src = (const unsigned char*)(A + abs_row * K) + ki * A_ROW_BYTES + a_c;
+                *(uint4*)&lds_a[lds_idx] = *(const uint4*)src;
+            } else {
+                *(uint4*)&lds_a[lds_idx] = make_uint4(0,0,0,0);
             }
         }
 
@@ -122,7 +120,7 @@ void fp4_v4(
                 #pragma unroll
                 for (int v = 0; v < 4; v++) {
                     // Each v reads 16 bytes = 8 bf16 from a separately swizzled address
-                    uint4 c = *(uint4*)&lds_a[l32 * A_ROW_BYTES + byte_off + v*16];
+                    uint4 c = *(uint4*)&lds_a[l32 * A_ROW_PAD + byte_off + v*16];
                     unsigned int w[4]={c.x,c.y,c.z,c.w};
                     #pragma unroll
                     for (int j=0;j<4;j++) {
