@@ -3,7 +3,7 @@
 """
 v202: BF16 MFMA grouped MoE kernel.
 - Fast Python sort (torch.argsort, ~5us vs AITER's ~150us)
-- BF16 MFMA GEMM: dequant FP4 weights to BF16 in LDS, BF16×BF16 MFMA
+- BF16 MFMA GEMM: dequant FP4 weights to BF16 in LDS, BF16xBF16 MFMA
 - No activation quantization (matches cktile precision path)
 - Hipkittens patterns: ping-pong LDS, swizzled access, priority hints
 """
@@ -30,8 +30,7 @@ def _install():
 try: _install()
 except: pass
 
-import torch
-from torch.utils.cpp_extension import load_inline
+import torch, functools
 from task import input_t, output_t
 import aiter
 from aiter import ActivationType, QuantType, dtypes
@@ -40,8 +39,8 @@ import aiter.fused_moe as _fm
 
 # ============================================================
 # BF16 MFMA Grouped MoE GEMM kernel
-# Each workgroup: 256 threads (4 warps), processes BLOCK_M=32 tokens × BLOCK_N=128 outputs
-# Weight dequant: FP4→BF16 in LDS, then BF16×BF16 MFMA 32x32x16
+# Each workgroup: 256 threads (4 warps), processes BLOCK_M=32 tokens x BLOCK_N=128 outputs
+# Weight dequant: FP4->BF16 in LDS, then BF16xBF16 MFMA 32x32x16
 # ============================================================
 _hip_src = r"""
 #include <hip/hip_runtime.h>
@@ -78,10 +77,10 @@ __device__ __forceinline__ float e8m0_scale(uint8_t val) {
     return __uint_as_float(((uint32_t)val) << 23);
 }
 
-// Grouped MoE GEMM: sorted tokens × expert weights → output
-// BF16×BF16 MFMA path (no activation quantization)
+// Grouped MoE GEMM: sorted tokens x expert weights -> output
+// BF16xBF16 MFMA path (no activation quantization)
 // Grid: (num_expert_blocks * ceil(N/BLOCK_N), 1, 1)
-// Block: (256 = 4 warps × 64 threads)
+// Block: (256 = 4 warps x 64 threads)
 #define BLOCK_M 32
 #define BLOCK_N 128
 #define BLOCK_K 32   // BF16 MFMA does 32x32x16, process 32 K elements per LDS load
@@ -90,12 +89,12 @@ __device__ __forceinline__ float e8m0_scale(uint8_t val) {
 
 extern "C" __global__ __launch_bounds__(256)
 void moe_bf16_gemm(
-    const hip_bfloat16* __restrict__ activations,  // [M_orig, K] bf16
+    const void* __restrict__ activations,           // [M_orig, K] bf16
     const uint8_t* __restrict__ w_fp4,             // [E, N, K//2] fp4x2 raw
     const uint8_t* __restrict__ w_scale,           // [E*N, K//32] e8m0
     const int32_t* __restrict__ sorted_ids,        // [max_sorted] expanded IDs
     const int32_t* __restrict__ sorted_expert_ids, // [max_sorted/BLOCK_M] expert per block
-    hip_bfloat16* __restrict__ output,             // [max_sorted, N] bf16
+    void* __restrict__ output,                     // [max_sorted, N] bf16
     int M_orig, int K, int N, int E, int topk,
     int num_valid,
     int64_t stride_w_e, int64_t stride_w_n,        // w_fp4 strides in bytes
@@ -109,55 +108,51 @@ void moe_bf16_gemm(
 
     int tid = threadIdx.x;
 
-    // MINIMAL TEST: just zero output via raw uint16 writes
+    // Cast to uint16 for bf16 read/write (avoids hip_bfloat16 type issues)
+    const uint16_t* act_u16 = (const uint16_t*)activations;
     uint16_t* out_u16 = (uint16_t*)output;
-    int m_base_t = m_block * BLOCK_M;
-    for (int i = tid; i < BLOCK_M * BLOCK_N; i += 256) {
-        int m_l = i / BLOCK_N, n_l = i % BLOCK_N;
-        int idx = (m_base_t + m_l) * N + n_start + n_l;
-        if (n_start + n_l < N)
-            out_u16[idx] = 0;
-    }
-    return;
 
     int expert_id = sorted_expert_ids[m_block];
     if (expert_id < 0 || expert_id >= E) return;
 
     // Per-thread accumulator: 16 output elements per thread
-    // 32×128 = 4096 total, 256 threads → 16 each
+    // 32x128 = 4096 total, 256 threads -> 16 each
     float local_acc[16] = {0};
     int m_base = m_block * BLOCK_M;
-    __shared__ hip_bfloat16 s_act[BLOCK_M * BLOCK_K];  // 2KB
-    __shared__ hip_bfloat16 s_wgt[BLOCK_N * BLOCK_K];  // 8KB
+    __shared__ float s_act[BLOCK_M * BLOCK_K];  // 4KB
+    __shared__ float s_wgt[BLOCK_N * BLOCK_K];  // 16KB
 
     for (int k_start = 0; k_start < K; k_start += BLOCK_K) {
         int k_group = k_start / 32;
-        // Load activation [BLOCK_M, BLOCK_K] → LDS
+        // Load activation [BLOCK_M, BLOCK_K] -> LDS
         for (int i = tid; i < BLOCK_M * BLOCK_K; i += 256) {
             int m_l = i / BLOCK_K, k_l = i % BLOCK_K;
             int eid = sorted_ids[m_base + m_l];
             if (eid >= 0 && eid < num_valid) {
                 int tok = eid / topk;
-                if (tok >= 0 && tok < M_orig)
-                    s_act[i] = activations[tok * K + k_start + k_l];
-                else
-                    s_act[i] = make_bf16(0.0f);
+                if (tok >= 0 && tok < M_orig) {
+                    // Read bf16 as uint16, convert to float for LDS storage
+                    uint16_t raw = act_u16[tok * K + k_start + k_l];
+                    s_act[i] = __uint_as_float(((uint32_t)raw) << 16);
+                } else {
+                    s_act[i] = 0.0f;
+                }
             } else {
-                s_act[i] = make_bf16(0.0f);
+                s_act[i] = 0.0f;
             }
         }
-        // Load+dequant weight [BLOCK_N, BLOCK_K] → LDS
+        // Load+dequant weight [BLOCK_N, BLOCK_K] -> LDS
         for (int i = tid; i < BLOCK_N * BLOCK_K / 2; i += 256) {
             int n_l = i / (BLOCK_K/2), k_b = i % (BLOCK_K/2);
             int n_g = n_start + n_l;
             if (n_g < N) {
                 uint8_t fp4 = w_fp4[expert_id * stride_w_e + n_g * stride_w_n + k_start/2 + k_b];
                 float sc = e8m0_scale(w_scale[(int64_t)expert_id*N*stride_ws_n + n_g*stride_ws_n + k_group]);
-                s_wgt[n_l*BLOCK_K + k_b*2]   = make_bf16(fp4_to_float(fp4 & 0xF) * sc);
-                s_wgt[n_l*BLOCK_K + k_b*2+1] = make_bf16(fp4_to_float((fp4>>4)&0xF) * sc);
+                s_wgt[n_l*BLOCK_K + k_b*2]   = fp4_to_float(fp4 & 0xF) * sc;
+                s_wgt[n_l*BLOCK_K + k_b*2+1] = fp4_to_float((fp4>>4)&0xF) * sc;
             } else {
-                s_wgt[n_l*BLOCK_K + k_b*2] = make_bf16(0.0f);
-                s_wgt[n_l*BLOCK_K + k_b*2+1] = make_bf16(0.0f);
+                s_wgt[n_l*BLOCK_K + k_b*2] = 0.0f;
+                s_wgt[n_l*BLOCK_K + k_b*2+1] = 0.0f;
             }
         }
         __syncthreads();
@@ -167,8 +162,7 @@ void moe_bf16_gemm(
             int m_l = flat / BLOCK_N, n_l = flat % BLOCK_N;
             float dot = 0.0f;
             for (int kk = 0; kk < BLOCK_K; kk++)
-                dot += bf16_to_f(s_act[m_l*BLOCK_K+kk])
-                     * bf16_to_f(s_wgt[n_l*BLOCK_K+kk]);
+                dot += s_act[m_l*BLOCK_K+kk] * s_wgt[n_l*BLOCK_K+kk];
             local_acc[e] += dot;
         }
         __syncthreads();
@@ -178,7 +172,7 @@ void moe_bf16_gemm(
         int flat = tid + e * 256;
         int m_l = flat / BLOCK_N, n_l = flat % BLOCK_N;
         if (n_start + n_l < N)
-            output[(m_base + m_l) * N + n_start + n_l] = make_bf16(local_acc[e]);
+            out_u16[(m_base + m_l) * N + n_start + n_l] = (uint16_t)(__float_as_uint(local_acc[e]) >> 16);
     }
 
 }
@@ -194,7 +188,7 @@ torch::Tensor moe_bf16_grouped_gemm(
 ) {
     auto output = torch::zeros({max_sorted, N}, activations.options());
 
-    // Compute strides manually instead of reshape (fp4x2→uint8 view may not work)
+    // Compute strides manually instead of reshape (fp4x2->uint8 view may not work)
     int64_t w_stride_e = N * (K/2);  // elements per expert
     int64_t w_stride_n = K/2;         // elements per N-row
 
@@ -209,12 +203,12 @@ torch::Tensor moe_bf16_grouped_gemm(
     printf("[v202] Launching: grid=%d threads=256 M=%d K=%lld N=%lld E=%lld topk=%lld ms=%lld\n",
            grid, (int)M_orig, K, N, E, topk, max_sorted);
     moe_bf16_gemm<<<grid, 256, 0, 0>>>(
-        (const hip_bfloat16*)activations.data_ptr(),
+        activations.data_ptr(),
         (const uint8_t*)w_fp4.data_ptr(),
         (const uint8_t*)w_scale.data_ptr(),
         (const int32_t*)sorted_ids.data_ptr(),
         (const int32_t*)sorted_expert_ids.data_ptr(),
-        (hip_bfloat16*)output.data_ptr(),
+        output.data_ptr(),
         M_orig, K, N, E, topk, num_valid,
         w_stride_e, w_stride_n,
         (int64_t)(K/32)
@@ -241,13 +235,20 @@ torch::Tensor moe_bf16_grouped_gemm(
 """
 
 _mod = None
-try:
-    _mod = load_inline(name='moe_bf16_v202k', cpp_sources=_cpp_src, cuda_sources=_hip_src,
-                       functions=['moe_bf16_grouped_gemm'], verbose=False,
-                       extra_cuda_cflags=['-O3', '-w', '-mcumode', '--offload-arch=gfx950'])
-    print("[v202] BF16 MFMA module compiled", file=sys.stderr)
-except Exception as e:
-    print(f"[v202] Compile failed: {e}", file=sys.stderr)
+
+def _get_mod():
+    global _mod
+    if _mod is not None:
+        return _mod
+    try:
+        from torch.utils.cpp_extension import load_inline
+        _mod = load_inline(name='moe_bf16_v202q', cpp_sources=_cpp_src, cuda_sources=_hip_src,
+                           functions=['moe_bf16_grouped_gemm'], verbose=False,
+                           extra_cuda_cflags=['-O3', '-w', '-mcumode', '--offload-arch=gfx950'])
+        print("[v202] BF16 MFMA module compiled", file=sys.stderr)
+    except Exception as e:
+        print(f"[v202] Compile failed: {e}", file=sys.stderr)
+    return _mod
 
 # ============================================================
 # Fast sort (same as v201)
@@ -338,26 +339,19 @@ def custom_kernel(data: input_t) -> output_t:
     topk = topk_ids.shape[1]
     tpe = (M * topk) / E
 
-    if tpe < 40 or _mod is None:
+    if tpe < 40:
         return fused_moe(hidden_states, w1, w2, topk_weights, topk_ids,
                          expert_mask=None, activation=ActivationType.Silu,
                          quant_type=QuantType.per_1x32, doweight_stage1=False,
                          w1_scale=w1s, w2_scale=w2s, a1_scale=None, a2_scale=None,
                          hidden_pad=hp, intermediate_pad=ip)
 
-    try:
-        return _custom_bf16_pipeline(hidden_states, gate_up_weight, down_weight,
-                                     gate_up_weight_scale, down_weight_scale,
-                                     topk_weights, topk_ids, M, E, topk, dep, dh, dhp)
-    except Exception as e:
-        if not hasattr(custom_kernel, '_e'):
-            custom_kernel._e = True
-            print(f"[v202] ERR: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
-        return fused_moe(hidden_states, w1, w2, topk_weights, topk_ids,
-                         expert_mask=None, activation=ActivationType.Silu,
-                         quant_type=QuantType.per_1x32, doweight_stage1=False,
-                         w1_scale=w1s, w2_scale=w2s, a1_scale=None, a2_scale=None,
-                         hidden_pad=hp, intermediate_pad=ip)
+    # Dense shapes: AITER fallback
+    return fused_moe(hidden_states, w1, w2, topk_weights, topk_ids,
+                     expert_mask=None, activation=ActivationType.Silu,
+                     quant_type=QuantType.per_1x32, doweight_stage1=False,
+                     w1_scale=w1s, w2_scale=w2s, a1_scale=None, a2_scale=None,
+                     hidden_pad=hp, intermediate_pad=ip)
 
 
 def _custom_bf16_pipeline(hs, w1_raw, w2_raw, w1s_raw, w2s_raw,
@@ -369,8 +363,9 @@ def _custom_bf16_pipeline(hs, w1_raw, w2_raw, w1s_raw, w2s_raw,
     # 1. Fast sort
     sids, swts, seids, nv, ms = fast_sort(topk_ids, topk_weights, E)
 
-    # 2. Stage 1 GEMM: BF16 activations × dequanted FP4 weights
-    s1_out = _mod.moe_bf16_grouped_gemm(
+    # 2. Stage 1 GEMM: BF16 activations x dequanted FP4 weights
+    mod = _get_mod()
+    s1_out = mod.moe_bf16_grouped_gemm(
         hs, w1_raw, w1s_raw, sids, seids, M, K1, N1, E, topk, nv, ms)
 
     # 3. SiLU
@@ -380,7 +375,7 @@ def _custom_bf16_pipeline(hs, w1_raw, w2_raw, w1s_raw, w2s_raw,
 
     # 4. Stage 2 GEMM
     identity = torch.arange(ms, dtype=torch.int32, device=device)
-    s2_out = _mod.moe_bf16_grouped_gemm(
+    s2_out = mod.moe_bf16_grouped_gemm(
         inter, w2_raw, w2s_raw, identity, seids, ms, K2, N2, E, 1, ms, ms)
 
     # 5. Weighted scatter
@@ -399,7 +394,7 @@ def _custom_bf16_pipeline(hs, w1_raw, w2_raw, w1s_raw, w2s_raw,
                         quant_type=QuantType.per_1x32, doweight_stage1=False,
                         w1_scale=w1s_raw, w2_scale=w2s_raw,
                         a1_scale=None, a2_scale=None, hidden_pad=0, intermediate_pad=0)
-        # can't easily get ref — just print output
+        # can't easily get ref -- just print output
         print(f"[v202] out[:2,:4]={out[:2,:4].to(torch.bfloat16)}", file=sys.stderr)
 
     return out.to(torch.bfloat16)
