@@ -242,7 +242,7 @@ def _get_mod():
         return _mod
     try:
         from torch.utils.cpp_extension import load_inline
-        _mod = load_inline(name='moe_bf16_v202r', cpp_sources=_cpp_src, cuda_sources=_hip_src,
+        _mod = load_inline(name='moe_bf16_v202t', cpp_sources=_cpp_src, cuda_sources=_hip_src,
                            functions=['moe_bf16_grouped_gemm'], verbose=False,
                            extra_cuda_cflags=['-O3', '-w', '-mcumode', '--offload-arch=gfx950'])
         print("[v202] BF16 MFMA module compiled", file=sys.stderr)
@@ -387,20 +387,38 @@ def _custom_bf16_pipeline(hs, w1_raw, w2_raw, w1s_raw, w2s_raw,
     # 1. Fast sort
     sids, swts, seids, nv, ms = fast_sort(topk_ids, topk_weights, E)
 
-    # 2. Stage 1 GEMM: BF16 activations x dequanted FP4 weights
+    # 2. Quantize activations to FP4 then dequant back to BF16
+    # This round-trip introduces FP4 precision loss matching AITER's path
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    from aiter.utility.fp4_utils import mxfp4_to_f32, e8m0_to_f32
+    h_q, h_scale = dynamic_mxfp4_quant(hs)
+    # Dequant: fp4 values * scales
+    h_f32 = mxfp4_to_f32(h_q)  # [M, K]
+    hs_f32 = e8m0_to_f32(h_scale)  # [M_pad, K//32]
+    hs_exp = hs_f32[:M].repeat_interleave(32, dim=-1)[:, :K1]  # [M, K]
+    hs_dequant = (h_f32 * hs_exp).to(torch.bfloat16)  # [M, K] bf16 with FP4 precision
+
+    # 3. Stage 1 GEMM with FP4-quantized activations
     mod = _get_mod()
     s1_out = mod.moe_bf16_grouped_gemm(
-        hs, w1_raw, w1s_raw, sids, seids, M, K1, N1, E, topk, nv, ms)
+        hs_dequant, w1_raw, w1s_raw, sids, seids, M, K1, N1, E, topk, nv, ms)
 
     # 3. SiLU
     gate = s1_out[:, :dep].float()
     up = s1_out[:, dep:2*dep].float()
     inter = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
 
-    # 4. Stage 2 GEMM
+    # 4. Requant intermediate to FP4 then dequant (match AITER's requant step)
+    inter_q, inter_s = dynamic_mxfp4_quant(inter)
+    inter_f32 = mxfp4_to_f32(inter_q)
+    ints_f32 = e8m0_to_f32(inter_s)
+    ints_exp = ints_f32[:ms].repeat_interleave(32, dim=-1)[:, :K2]
+    inter_dq = (inter_f32 * ints_exp).to(torch.bfloat16)
+
+    # 5. Stage 2 GEMM
     identity = torch.arange(ms, dtype=torch.int32, device=device)
     s2_out = mod.moe_bf16_grouped_gemm(
-        inter, w2_raw, w2s_raw, identity, seids, ms, K2, N2, E, 1, ms, ms)
+        inter_dq, w2_raw, w2s_raw, identity, seids, ms, K2, N2, E, 1, ms, ms)
 
     # 5. Weighted scatter
     valid = sids < nv
