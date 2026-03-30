@@ -73,19 +73,23 @@ fi
 (
     claude -p "You are reviewing a GPU kernel competition submission for anti-cheat compliance.
 
-The competition rules:
-1. Cross-invocation caching is BANNED — storing outputs or preprocessed data across calls keyed by pointer addresses or tensor properties is not allowed.
-2. Leaderboard mode uses recheck=True which regenerates data each call, so cached results return stale values and FAIL.
-3. The word 'stream' must not appear in the submission (server rejects it).
-4. Within-call preprocessing and shape-aware code emission are ALLOWED.
-5. Pre-computing configs, JIT warmup at import time, and pre-allocated output buffers are ALLOWED.
+Read the anti-cheat policy from these two URLs:
+1. https://gist.githubusercontent.com/hargup/4897f33df0d2425ac4c8c99dc8f6ec00
+2. https://deep-reinforce.com/defense_kernel_hack.html
 
-Review this submission file and report:
+Additional rules specific to this competition:
+- The word 'stream' must not appear in the submission (server rejects it).
+- Leaderboard mode uses recheck=True which regenerates data each call.
+- Within-call preprocessing, shape-aware code emission, and pre-allocated output buffers are ALLOWED.
+- JIT warmup at import time is ALLOWED.
+
+Review this submission file against those policies and report:
 - Any anti-cheat violations (FAIL)
 - Any suspicious patterns that might be unintentional violations (WARN)
 - If clean, say PASS
 
-Write your verdict as the first line: PASS, WARN, or FAIL.
+Write your verdict as the FIRST LINE: PASS, WARN, or FAIL.
+Then explain your reasoning.
 
 File: $FILE
 $(cat "$FILE")
