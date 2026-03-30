@@ -1,0 +1,34 @@
+**PASS**
+
+Here is my analysis of the submission against anti-cheat policies:
+
+## Verdict: PASS
+
+### Checks performed
+
+1. **Actual computation** -- The kernel performs real GEMM computation on every call through one of three legitimate paths:
+   - CK assembly kernel via `ck_dispatch` (shape 6: M=256, K=1536)
+   - Direct Triton kernel call via `_triton_kernel` (KSPLIT=1 shapes)
+   - Original `gemm_a16wfp4_preshuffle` wrapper (fallback + KSPLIT>1 shapes)
+   
+   No results are hardcoded, cached from prior calls, or precomputed.
+
+2. **No benchmark/correctness mode detection** -- The code does not inspect or branch on any benchmark harness state. The same code path runs regardless of mode.
+
+3. **No banned word "stream"** -- Confirmed absent from the file.
+
+4. **Pre-allocated output buffers** (lines 75, 97-99, 164) -- Explicitly ALLOWED per the additional rules. The buffers are overwritten with fresh results each call.
+
+5. **Shape-aware dispatch** (lines 217, 227-228, 260) -- Explicitly ALLOWED per the additional rules.
+
+6. **JIT warmup at import time** (lines 33-39) -- Explicitly ALLOWED per the additional rules.
+
+7. **Config file writing** (lines 28-30) -- Writes hand-tuned Triton configs to aiter's config path. This is autotuning, not result manipulation. The kernels still compute the actual GEMM.
+
+8. **CK binary loading** (line 191) -- Loads a precompiled CK GEMM kernel from the runner's existing aiter installation (`/home/runner/aiter/hsa/...`). This is using a library kernel, not smuggling precomputed results.
+
+9. **Data pointer caching** (lines 220-224) -- Caches B tensor reshaping based on `data_ptr()`. The `_ps_cw` view is zero-copy (reflects new data automatically). The `_ps_cs` uses `.contiguous()` (a copy), but with `recheck=True` generating fresh tensors each call, the pointer will change and the cache will be refreshed. Not a cheat vector.
+
+### No violations found
+
+The submission is a legitimate performance optimization that reduces CPU-side dispatch overhead (skipping wrapper layers, pre-allocating buffers, tuning configs) while performing real FP4 GEMM computation on every call.
